@@ -1,4 +1,4 @@
-"""Runnable local demo: contract-gated quantile publishing and canary rollout replay."""
+"""Runnable local demo: contract-gated quantile publishing and 50-seed Monte Carlo rollout replay."""
 
 from __future__ import annotations
 
@@ -8,6 +8,8 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
+
+import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = REPO_ROOT / "src"
@@ -63,6 +65,105 @@ def _approved_model_artifact() -> Dict[str, Any]:
     }
 
 
+def _generate_seed_events(seed: int) -> List[ShardObservation]:
+    rng = np.random.default_rng(seed)
+    events: List[ShardObservation] = []
+
+    # Fast anomalous canary cohort (small capacity share, reports first around +0.060 delta)
+    for i in range(6):
+        delta = float(rng.normal(loc=0.060, scale=0.012))
+        events.append(
+            ShardObservation(
+                region_id="region-canary-fast",
+                shard_id=f"c-{i}",
+                reported_fraction=1.0,
+                sample_size=450,
+                observed_delta=round(delta, 6),
+            )
+        )
+
+    # Larger slower baseline regions report later around +0.004 delta
+    for reg in ("region-core-a", "region-core-b", "region-core-c"):
+        for i in range(18):
+            delta = float(rng.normal(loc=0.004, scale=0.012))
+            events.append(
+                ShardObservation(
+                    region_id=reg,
+                    shard_id=f"{reg}-{i}",
+                    reported_fraction=1.0,
+                    sample_size=600,
+                    observed_delta=round(delta, 6),
+                )
+            )
+    return events
+
+
+def run_monte_carlo_evaluation(
+    seeds: range = range(1, 51),
+    checkpoints: tuple = (0.05, 0.25, 0.50, 1.0),
+) -> Dict[str, Any]:
+    weights = {
+        "region-canary-fast": 1.0,
+        "region-core-a": 4.0,
+        "region-core-b": 4.0,
+        "region-core-c": 4.0,
+    }
+    true_delta = round(
+        (1.0 * 0.060 + 4.0 * 0.004 + 4.0 * 0.004 + 4.0 * 0.004) / 13.0,
+        6,
+    )
+
+    per_cp_raw_err: Dict[float, List[float]] = {cp: [] for cp in checkpoints}
+    per_cp_eb_err: Dict[float, List[float]] = {cp: [] for cp in checkpoints}
+    per_cp_covered: Dict[float, List[bool]] = {cp: [] for cp in checkpoints}
+    per_cp_shards: Dict[float, int] = {}
+
+    for seed in seeds:
+        events = _generate_seed_events(seed)
+        rows = run_convergence_backtest(
+            events,
+            true_fleet_delta=true_delta,
+            fleet_prior_delta=0.005,
+            checkpoints=checkpoints,
+            prior_strength_k=10.0,
+            region_weights=weights,
+            monte_carlo_draws=400,
+            seed=seed,
+        )
+        for row in rows:
+            cp = row.checkpoint_fraction
+            per_cp_shards[cp] = row.reported_shards
+            if row.raw_abs_error is not None:
+                per_cp_raw_err[cp].append(row.raw_abs_error)
+            per_cp_eb_err[cp].append(row.shrunk_abs_error)
+            per_cp_covered[cp].append(row.true_delta_covered)
+
+    summary_rows: List[Dict[str, Any]] = []
+    seed_count = len(list(seeds))
+    for cp in checkpoints:
+        raw_arr = np.array(per_cp_raw_err[cp], dtype=float)
+        eb_arr = np.array(per_cp_eb_err[cp], dtype=float)
+        cov_arr = np.array(per_cp_covered[cp], dtype=bool)
+        summary_rows.append(
+            {
+                "checkpoint_pct": int(round(cp * 100)),
+                "reported_shards": per_cp_shards[cp],
+                "raw_mae": round(float(np.mean(raw_arr)), 6),
+                "eb_mae": round(float(np.mean(eb_arr)), 6),
+                "raw_median_ae": round(float(np.median(raw_arr)), 6),
+                "eb_median_ae": round(float(np.median(eb_arr)), 6),
+                "ci95_coverage_rate": round(float(np.mean(cov_arr)), 4),
+                "ci95_covered_seeds": f"{int(np.sum(cov_arr))}/{seed_count}",
+            }
+        )
+
+    return {
+        "seeds": f"{min(seeds)}..{max(seeds)} ({seed_count} seeds)",
+        "true_fleet_delta": true_delta,
+        "checkpoints": summary_rows,
+    }
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="guarded-forecast-demo-") as tmp:
         root = Path(tmp)
@@ -108,47 +209,8 @@ def main() -> int:
         assert first["published"] is True
         assert second["published"] is False and second["reason"] == "unchanged_inputs"
 
-        # 3. Skewed progressive canary rollout replay: low-latency canary shards report before heavy regions.
-        events: List[ShardObservation] = []
-        # Fast anomalous region (small capacity share, reports first with +0.060 latency delta)
-        for i in range(6):
-            events.append(
-                ShardObservation(
-                    region_id="region-canary-fast",
-                    shard_id=f"c-{i}",
-                    reported_fraction=1.0,
-                    sample_size=450,
-                    observed_delta=0.058 + (i % 3) * 0.002,
-                )
-            )
-        # Larger slower regions report later close to baseline (+0.004 delta)
-        for reg in ("region-core-a", "region-core-b", "region-core-c"):
-            for i in range(18):
-                events.append(
-                    ShardObservation(
-                        region_id=reg,
-                        shard_id=f"{reg}-{i}",
-                        reported_fraction=1.0,
-                        sample_size=600,
-                        observed_delta=0.003 + (i % 3) * 0.001,
-                    )
-                )
-
-        # True weighted fleet delta across regions (weights: fast=1, core-a=4, core-b=4, core-c=4)
-        weights = {"region-canary-fast": 1.0, "region-core-a": 4.0, "region-core-b": 4.0, "region-core-c": 4.0}
-        true_delta = round(
-            (1.0 * 0.060 + 4.0 * 0.004 + 4.0 * 0.004 + 4.0 * 0.004) / 13.0,
-            6,
-        )
-        replay = run_convergence_backtest(
-            events,
-            true_fleet_delta=true_delta,
-            fleet_prior_delta=0.005,
-            checkpoints=(0.05, 0.25, 0.50, 1.0),
-            prior_strength_k=10.0,
-            region_weights=weights,
-            seed=20261124,
-        )
+        # 3. 50-seed Monte Carlo progressive convergence evaluation across rollout checkpoints.
+        mc_eval = run_monte_carlo_evaluation()
 
         output = {
             "draft_model_rejected": rejected_draft,
@@ -158,21 +220,9 @@ def main() -> int:
             "horizon_1h_quantiles": {
                 k: first["forecast"]["points"][0][k] for k in ("p10", "p50", "p90")
             },
-            "true_fleet_delta": true_delta,
-            "rollout_convergence": [
-                {
-                    "checkpoint_pct": int(row.checkpoint_fraction * 100),
-                    "reported_shards": row.reported_shards,
-                    "raw_mean": row.raw_mean,
-                    "raw_abs_err": row.raw_abs_error,
-                    "eb_shrunk_mean": row.shrunk_mean,
-                    "eb_abs_err": row.shrunk_abs_error,
-                    "ci95": [row.ci95_low, row.ci95_high],
-                }
-                for row in replay
-            ],
+            "monte_carlo_50_seed_eval": mc_eval,
         }
-        print("=== Guarded Forecast Publisher & Rollout Convergence Demo ===")
+        print("=== Guarded Forecast Publisher & 50-Seed Rollout Convergence ===")
         print(json.dumps(output, indent=2))
     return 0
 

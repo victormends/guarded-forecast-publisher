@@ -1,6 +1,6 @@
 # guarded-forecast-publisher
 
-A Python 3.11+ verification-gated quantile publisher (CI-verified on Ubuntu 3.11 and 3.12; compatible with 3.9+) and Empirical Bayes partial-rollout estimator for multi-region capacity and canary telemetry.
+A Python 3.11+ verification-gated quantile publisher (CI-verified on Ubuntu 3.11 and 3.12) and Empirical Bayes partial-rollout estimator for multi-region capacity and canary telemetry.
 
 ---
 
@@ -60,7 +60,7 @@ Partial Canary Shards -----> estimate_empirical_bayes_rollout()
 
 ## Local Quickstart
 
-Requires **Python 3.11+** (CI-verified on Ubuntu 3.11 and 3.12; compatible with 3.9+, `numpy` + `pytest` for tests).
+Requires **Python 3.11+** (CI-verified on Ubuntu 3.11 and 3.12, `numpy` + `pytest` for tests).
 
 ```bash
 python -m pip install -e ".[dev]"
@@ -68,18 +68,20 @@ pytest -v
 python scripts/run_replay_demo.py
 ```
 
-## Measured Replay Convergence Results
+## Measured 50-Seed Monte Carlo Convergence Results
 
-Output from `python scripts/run_replay_demo.py` (`true_fleet_delta = 0.008308` across 60 shards with skewed fast-reporting early clusters):
+Output from `python scripts/run_replay_demo.py` across `seeds 1..50` (`true_fleet_delta = 0.008308` across `60` shards with skewed fast-reporting early clusters):
 
-| Rollout Checkpoint | Reported Shards | Raw Mean | Raw Abs Error | EB Shrunk Mean | EB Abs Error | 95% Credible Interval |
+| Rollout Checkpoint | Reported Shards | Raw MAE | EB Shrunk MAE | Raw Median AE | EB Median AE | Empirical 95% CI Coverage |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| `5%` | `3` | `0.06` | `0.051692` | `0.005976` | `0.002332` | `[-0.008834, 0.023943]` |
-| `25%` | `15` | `0.0264` | `0.018092` | `0.006441` | `0.001867` | `[-0.005723, 0.020357]` |
-| `50%` | `30` | `0.0152` | `0.006892` | `0.006273` | `0.002035` | `[-0.001197, 0.016206]` |
-| `100%` | `60` | `0.0096` | `0.001292` | `0.005993` | `0.002315` | `[0.003042, 0.00961]` |
+| `5%` | `3` | `0.051262` | `0.002339` | `0.052918` | `0.002310` | `1.0000` (`50/50`) |
+| `25%` | `15` | `0.018327` | `0.001778` | `0.018217` | `0.001804` | `1.0000` (`50/50`) |
+| `50%` | `30` | `0.006475` | `0.002238` | `0.006451` | `0.002240` | `1.0000` (`50/50`) |
+| `100%` | `60` | `0.001663` | `0.002309` | `0.001368` | `0.002377` | `0.8000` (`40/50`) |
 
-At the `5%` skewed canary rollout checkpoint, Empirical Bayes shrinkage reduces absolute estimation error by ~22.2x (`0.002332` vs `0.051692`).
+### Bias-Variance Trade-Off at `100%` Completion
+
+Empirical Bayes shrinkage improves estimation accuracy sharply during early partial rollouts (`5%` to `50%`), cutting Mean Absolute Error by ~21.9x at `5%` (`0.002339` vs `0.051262`) and ~10.3x at `25%` (`0.001778` vs `0.018327`) while preserving `50/50` (`100%`) credible interval coverage. Once `100%` of clusters have reported, however, continued shrinkage toward `fleet_prior_delta` introduces residual bias (`EB MAE = 0.002309` vs `Raw MAE = 0.001663`, dropping empirical 95% CI coverage to `40/50` / `80%`) relative to the full-fleet raw sample mean. Empirical Bayes shrinkage is therefore designed strictly for early partial rollouts (`5%` to `50%`) before switching to the raw unweighted fleet mean near completion.
 
 ## License
 
