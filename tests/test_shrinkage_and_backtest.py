@@ -105,3 +105,110 @@ def test_skewed_partial_rollout_shrinkage_beats_naive_mean_early() -> None:
     assert early_25pct.shrunk_abs_error < early_25pct.raw_abs_error
     assert final_100pct.shrunk_abs_error < early_5pct.shrunk_abs_error
     assert final_100pct.true_delta_covered is True
+
+
+def test_normal_normal_conjugate_posterior_exact_values() -> None:
+    obs = [
+        ShardObservation("reg-a", f"s-{i}", reported_fraction=1.0, sample_size=500, observed_delta=0.030)
+        for i in range(4)
+    ]
+    prior_mu = 0.005
+    prior_sigma = 0.012
+    within_sigma = 0.018
+
+    est = estimate_empirical_bayes_rollout(
+        obs,
+        fleet_prior_delta=prior_mu,
+        within_shard_sigma=within_sigma,
+        prior_sigma=prior_sigma,
+        region_weights={"reg-a": 1.0, "reg-b": 3.0},
+        monte_carlo_draws=500,
+        seed=11,
+    )
+
+    var_prior = prior_sigma ** 2
+    var_obs = (within_sigma ** 2) / 4.0
+    expected_lam = var_prior / (var_prior + var_obs)
+    expected_mean = expected_lam * 0.030 + (1.0 - expected_lam) * prior_mu
+    expected_se = math.sqrt((1.0 - expected_lam) * var_prior)
+
+    reg_a = est.regions["reg-a"]
+    assert reg_a.lambda_weight == pytest.approx(expected_lam, abs=1e-6)
+    assert reg_a.shrunk_mean == pytest.approx(expected_mean, abs=1e-6)
+    assert reg_a.standard_error == pytest.approx(expected_se, abs=1e-6)
+
+    reg_b = est.regions["reg-b"]
+    assert reg_b.qualified_shards == 0
+    assert reg_b.lambda_weight == 0.0
+    assert reg_b.shrunk_mean == pytest.approx(prior_mu, abs=1e-6)
+    assert reg_b.standard_error == pytest.approx(prior_sigma, abs=1e-6)
+
+
+def test_conjugate_eb_finite_population_convergence_at_100pct() -> None:
+    obs = [
+        ShardObservation("reg-a", f"a-{i}", reported_fraction=1.0, sample_size=500, observed_delta=0.025)
+        for i in range(10)
+    ] + [
+        ShardObservation("reg-b", f"b-{i}", reported_fraction=1.0, sample_size=500, observed_delta=-0.010)
+        for i in range(10)
+    ]
+    est = estimate_empirical_bayes_rollout(
+        obs,
+        fleet_prior_delta=0.005,
+        within_shard_sigma=0.018,
+        prior_sigma=0.012,
+        region_total_shards={"reg-a": 10, "reg-b": 10},
+        monte_carlo_draws=300,
+        seed=22,
+    )
+
+    for reg_id, expected_raw in (("reg-a", 0.025), ("reg-b", -0.010)):
+        reg = est.regions[reg_id]
+        assert reg.lambda_weight == 1.0
+        assert reg.shrunk_mean == pytest.approx(expected_raw, abs=1e-6)
+        assert reg.standard_error == 0.0
+
+
+def test_hierarchical_200_seed_monte_carlo_ci_calibration() -> None:
+    import numpy as np
+
+    weights = {
+        "region-canary-fast": 1.0,
+        "region-core-a": 4.0,
+        "region-core-b": 4.0,
+        "region-core-c": 4.0,
+    }
+    w_tot = sum(weights.values())
+    mu0 = 0.005
+    tau0 = 0.012
+    sigma_obs = 0.018
+    checkpoints = (0.05, 0.25, 0.50, 1.0)
+    covered = {cp: 0 for cp in checkpoints}
+
+    for seed in range(1, 201):
+        rng = np.random.default_rng(seed)
+        thetas = {r: float(rng.normal(mu0, tau0)) for r in weights}
+        true_delta = sum(weights[r] * thetas[r] for r in weights) / w_tot
+        events = [
+            ShardObservation(r, f"{r}-{i}", 1.0, 500, round(float(rng.normal(thetas[r], sigma_obs)), 6))
+            for r in ("region-canary-fast", "region-core-a", "region-core-b", "region-core-c")
+            for i in range(15)
+        ]
+        rows = run_convergence_backtest(
+            events,
+            true_fleet_delta=true_delta,
+            fleet_prior_delta=mu0,
+            checkpoints=checkpoints,
+            within_shard_sigma=sigma_obs,
+            prior_sigma=tau0,
+            region_weights=weights,
+            monte_carlo_draws=1000,
+            seed=seed,
+        )
+        for row in rows:
+            if row.true_delta_covered:
+                covered[row.checkpoint_fraction] += 1
+
+    for cp in checkpoints:
+        rate = covered[cp] / 200.0
+        assert 0.90 <= rate <= 0.98, f"Unreliable 95% CI coverage at {cp}: {rate}"

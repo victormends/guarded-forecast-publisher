@@ -76,13 +76,20 @@ def estimate_empirical_bayes_rollout(
     monte_carlo_draws: int = 200,
     seed: int = 42,
     region_weights: Optional[Mapping[str, float]] = None,
+    within_shard_sigma: Optional[float] = None,
+    prior_sigma: Optional[float] = None,
+    region_total_shards: Optional[Mapping[str, int]] = None,
 ) -> RolloutEstimate:
     """Estimate fleet metric shift from partial/skewed canary rollout reports.
 
-    Regions with few completed shards (`n < k`) shrink smoothly toward
-    `fleet_prior_delta` via `lambda = n / (n + k)` instead of overreacting to
-    early noisy cohorts. Monte Carlo draws sample per-region uncertainty
-    `SE = max(se_floor, se_scale / sqrt(n))` to produce calibrated 95% intervals.
+    Supports two shrinkage modes:
+    1. Exact Normal-Normal conjugate Empirical Bayes (when `within_shard_sigma`
+       and `prior_sigma` are provided): computes regional weight
+       `lambda = tau0^2 / (tau0^2 + (sigma_obs^2 / n) * fpc)` and posterior
+       standard error `sqrt((1 - lambda) * tau0^2)`, with optional finite-population
+       correction via `region_total_shards`.
+    2. Legacy heuristic mode (when either sigma argument is None): shrinks via
+       `lambda = n / (n + k)` and `SE = max(se_floor, se_scale / sqrt(n))`.
     """
     if prior_strength_k <= 0:
         raise ValueError("prior_strength_k must be > 0")
@@ -90,6 +97,17 @@ def estimate_empirical_bayes_rollout(
         raise ValueError("monte_carlo_draws must be >= 10")
     if not (0.0 <= min_reported_fraction <= 1.0):
         raise ValueError("min_reported_fraction must be in [0, 1]")
+    if within_shard_sigma is not None and within_shard_sigma <= 0:
+        raise ValueError("within_shard_sigma must be > 0")
+    if prior_sigma is not None and prior_sigma <= 0:
+        raise ValueError("prior_sigma must be > 0")
+    if region_total_shards is not None:
+        for reg_name, reg_total in region_total_shards.items():
+            if reg_total <= 0:
+                raise ValueError(f"region_total_shards[{reg_name!r}] must be > 0, got {reg_total}")
+
+    use_conjugate_eb = within_shard_sigma is not None and prior_sigma is not None
+    effective_fallback_se = float(prior_sigma) if use_conjugate_eb else float(fallback_prior_se)
 
     by_region: Dict[str, List[ShardObservation]] = {}
     all_regions: set = set()
@@ -105,8 +123,8 @@ def estimate_empirical_bayes_rollout(
         return RolloutEstimate(
             fleet_mean=round(float(fleet_prior_delta), 6),
             raw_fleet_mean=None,
-            ci95_low=round(float(fleet_prior_delta - 1.96 * fallback_prior_se), 6),
-            ci95_high=round(float(fleet_prior_delta + 1.96 * fallback_prior_se), 6),
+            ci95_low=round(float(fleet_prior_delta - 1.96 * effective_fallback_se), 6),
+            ci95_high=round(float(fleet_prior_delta + 1.96 * effective_fallback_se), 6),
             slo_breach_prob=0.0,
             qualified_shards=0,
             total_observations=len(observations),
@@ -129,16 +147,42 @@ def estimate_empirical_bayes_rollout(
     for region_id in sorted(all_regions):
         q_obs = by_region.get(region_id, [])
         n_reg = len(q_obs)
-        if n_reg > 0:
-            raw_mean = float(sum(float(o.observed_delta) for o in q_obs) / n_reg)
-            lam = float(n_reg) / (float(n_reg) + float(prior_strength_k))
-            shrunk_mean = lam * raw_mean + (1.0 - lam) * float(fleet_prior_delta)
-            se = max(float(se_floor), float(se_scale) / math.sqrt(float(n_reg)))
+        if use_conjugate_eb:
+            assert within_shard_sigma is not None and prior_sigma is not None
+            if n_reg == 0:
+                raw_mean = None
+                lam = 0.0
+                shrunk_mean = float(fleet_prior_delta)
+                se = float(prior_sigma)
+            else:
+                raw_mean = float(sum(float(o.observed_delta) for o in q_obs) / n_reg)
+                n_tot = region_total_shards.get(region_id) if region_total_shards else None
+                fpc = (
+                    max(0.0, 1.0 - n_reg / float(n_tot))
+                    if n_tot is not None and n_tot > 0
+                    else 1.0
+                )
+                var_obs = ((float(within_shard_sigma) ** 2) / float(n_reg)) * fpc
+                var_prior = float(prior_sigma) ** 2
+                if var_obs <= 0.0:
+                    lam = 1.0
+                    shrunk_mean = raw_mean
+                    se = 0.0
+                else:
+                    lam = var_prior / (var_prior + var_obs)
+                    shrunk_mean = lam * raw_mean + (1.0 - lam) * float(fleet_prior_delta)
+                    se = math.sqrt((1.0 - lam) * var_prior)
         else:
-            raw_mean = None
-            lam = 0.0
-            shrunk_mean = float(fleet_prior_delta)
-            se = float(fallback_prior_se)
+            if n_reg > 0:
+                raw_mean = float(sum(float(o.observed_delta) for o in q_obs) / n_reg)
+                lam = float(n_reg) / (float(n_reg) + float(prior_strength_k))
+                shrunk_mean = lam * raw_mean + (1.0 - lam) * float(fleet_prior_delta)
+                se = max(float(se_floor), float(se_scale) / math.sqrt(float(n_reg)))
+            else:
+                raw_mean = None
+                lam = 0.0
+                shrunk_mean = float(fleet_prior_delta)
+                se = float(fallback_prior_se)
 
         region_estimates[region_id] = RegionShrinkageEstimate(
             region_id=region_id,
@@ -199,6 +243,9 @@ def run_convergence_backtest(
     monte_carlo_draws: int = 250,
     seed: int = 42,
     region_weights: Optional[Mapping[str, float]] = None,
+    within_shard_sigma: Optional[float] = None,
+    prior_sigma: Optional[float] = None,
+    region_total_shards: Optional[Mapping[str, int]] = None,
 ) -> List[CheckpointComparison]:
     """Replay skewed shard arrival order across rollout checkpoints and score convergence."""
     if not shard_events:
@@ -226,6 +273,9 @@ def run_convergence_backtest(
             monte_carlo_draws=monte_carlo_draws,
             seed=seed,
             region_weights=all_region_weights,
+            within_shard_sigma=within_shard_sigma,
+            prior_sigma=prior_sigma,
+            region_total_shards=region_total_shards,
         )
         raw_err = (
             round(abs(est.raw_fleet_mean - true_fleet_delta), 6)

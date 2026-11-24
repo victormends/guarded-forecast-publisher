@@ -1,4 +1,4 @@
-"""Runnable local demo: contract-gated quantile publishing and 50-seed Monte Carlo rollout replay."""
+"""Runnable local demo: contract-gated quantile publishing and 200-seed Monte Carlo rollout replay."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
@@ -20,6 +20,7 @@ from guarded_forecast import (
     MODEL_KIND,
     ForecastModelError,
     ShardObservation,
+    estimate_empirical_bayes_rollout,
     publish_if_inputs_changed,
     run_convergence_backtest,
 )
@@ -65,41 +66,49 @@ def _approved_model_artifact() -> Dict[str, Any]:
     }
 
 
-def _generate_seed_events(seed: int) -> List[ShardObservation]:
+def _generate_hierarchical_seed_events(
+    seed: int,
+    *,
+    fleet_prior_delta: float,
+    prior_sigma: float,
+    within_shard_sigma: float,
+    region_weights: Dict[str, float],
+    shards_per_region: int = 15,
+) -> Tuple[List[ShardObservation], float]:
     rng = np.random.default_rng(seed)
+    region_order = (
+        "region-canary-fast",
+        "region-core-a",
+        "region-core-b",
+        "region-core-c",
+    )
+    regional_thetas = {
+        reg: float(rng.normal(loc=fleet_prior_delta, scale=prior_sigma))
+        for reg in region_order
+    }
+    total_w = sum(region_weights[reg] for reg in region_order)
+    true_fleet_delta = sum(region_weights[reg] * regional_thetas[reg] for reg in region_order) / total_w
+
+    # Skewed rollout arrival order: fast canary cohort reports all shards first.
     events: List[ShardObservation] = []
-
-    # Fast anomalous canary cohort (small capacity share, reports first around +0.060 delta)
-    for i in range(6):
-        delta = float(rng.normal(loc=0.060, scale=0.012))
-        events.append(
-            ShardObservation(
-                region_id="region-canary-fast",
-                shard_id=f"c-{i}",
-                reported_fraction=1.0,
-                sample_size=450,
-                observed_delta=round(delta, 6),
-            )
-        )
-
-    # Larger slower baseline regions report later around +0.004 delta
-    for reg in ("region-core-a", "region-core-b", "region-core-c"):
-        for i in range(18):
-            delta = float(rng.normal(loc=0.004, scale=0.012))
+    for reg in region_order:
+        theta_r = regional_thetas[reg]
+        for i in range(shards_per_region):
+            delta = float(rng.normal(loc=theta_r, scale=within_shard_sigma))
             events.append(
                 ShardObservation(
                     region_id=reg,
                     shard_id=f"{reg}-{i}",
                     reported_fraction=1.0,
-                    sample_size=600,
+                    sample_size=500,
                     observed_delta=round(delta, 6),
                 )
             )
-    return events
+    return events, true_fleet_delta
 
 
 def run_monte_carlo_evaluation(
-    seeds: range = range(1, 51),
+    seeds: range = range(1, 201),
     checkpoints: tuple = (0.05, 0.25, 0.50, 1.0),
 ) -> Dict[str, Any]:
     weights = {
@@ -108,26 +117,36 @@ def run_monte_carlo_evaluation(
         "region-core-b": 4.0,
         "region-core-c": 4.0,
     }
-    true_delta = round(
-        (1.0 * 0.060 + 4.0 * 0.004 + 4.0 * 0.004 + 4.0 * 0.004) / 13.0,
-        6,
-    )
+    fleet_prior_delta = 0.005
+    prior_sigma = 0.012
+    within_shard_sigma = 0.018
+    shards_per_region = 15
 
     per_cp_raw_err: Dict[float, List[float]] = {cp: [] for cp in checkpoints}
     per_cp_eb_err: Dict[float, List[float]] = {cp: [] for cp in checkpoints}
     per_cp_covered: Dict[float, List[bool]] = {cp: [] for cp in checkpoints}
     per_cp_shards: Dict[float, int] = {}
 
+    last_events: List[ShardObservation] = []
     for seed in seeds:
-        events = _generate_seed_events(seed)
+        events, true_delta = _generate_hierarchical_seed_events(
+            seed,
+            fleet_prior_delta=fleet_prior_delta,
+            prior_sigma=prior_sigma,
+            within_shard_sigma=within_shard_sigma,
+            region_weights=weights,
+            shards_per_region=shards_per_region,
+        )
+        last_events = events
         rows = run_convergence_backtest(
             events,
             true_fleet_delta=true_delta,
-            fleet_prior_delta=0.005,
+            fleet_prior_delta=fleet_prior_delta,
             checkpoints=checkpoints,
-            prior_strength_k=10.0,
+            within_shard_sigma=within_shard_sigma,
+            prior_sigma=prior_sigma,
             region_weights=weights,
-            monte_carlo_draws=400,
+            monte_carlo_draws=1000,
             seed=seed,
         )
         for row in rows:
@@ -137,6 +156,28 @@ def run_monte_carlo_evaluation(
                 per_cp_raw_err[cp].append(row.raw_abs_error)
             per_cp_eb_err[cp].append(row.shrunk_abs_error)
             per_cp_covered[cp].append(row.true_delta_covered)
+
+    # Verify finite-population convergence when region_total_shards reaches 100% reporting.
+    fpc_totals = {reg: shards_per_region for reg in weights}
+    fpc_est = estimate_empirical_bayes_rollout(
+        last_events,
+        fleet_prior_delta=fleet_prior_delta,
+        within_shard_sigma=within_shard_sigma,
+        prior_sigma=prior_sigma,
+        region_weights=weights,
+        region_total_shards=fpc_totals,
+        monte_carlo_draws=1000,
+        seed=200,
+    )
+    fpc_check = {
+        reg: {
+            "lambda_weight": reg_est.lambda_weight,
+            "raw_mean": reg_est.raw_mean,
+            "shrunk_mean": reg_est.shrunk_mean,
+            "standard_error": reg_est.standard_error,
+        }
+        for reg, reg_est in fpc_est.regions.items()
+    }
 
     summary_rows: List[Dict[str, Any]] = []
     seed_count = len(list(seeds))
@@ -159,8 +200,14 @@ def run_monte_carlo_evaluation(
 
     return {
         "seeds": f"{min(seeds)}..{max(seeds)} ({seed_count} seeds)",
-        "true_fleet_delta": true_delta,
+        "model": {
+            "fleet_prior_delta": fleet_prior_delta,
+            "prior_sigma": prior_sigma,
+            "within_shard_sigma": within_shard_sigma,
+            "total_shards": shards_per_region * len(weights),
+        },
         "checkpoints": summary_rows,
+        "finite_population_100pct_check": fpc_check,
     }
 
 
@@ -209,7 +256,7 @@ def main() -> int:
         assert first["published"] is True
         assert second["published"] is False and second["reason"] == "unchanged_inputs"
 
-        # 3. 50-seed Monte Carlo progressive convergence evaluation across rollout checkpoints.
+        # 3. 200-seed Monte Carlo progressive convergence evaluation across rollout checkpoints.
         mc_eval = run_monte_carlo_evaluation()
 
         output = {
@@ -220,9 +267,9 @@ def main() -> int:
             "horizon_1h_quantiles": {
                 k: first["forecast"]["points"][0][k] for k in ("p10", "p50", "p90")
             },
-            "monte_carlo_50_seed_eval": mc_eval,
+            "monte_carlo_200_seed_eval": mc_eval,
         }
-        print("=== Guarded Forecast Publisher & 50-Seed Rollout Convergence ===")
+        print("=== Guarded Forecast Publisher & 200-Seed Rollout Convergence ===")
         print(json.dumps(output, indent=2))
     return 0
 

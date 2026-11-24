@@ -14,7 +14,7 @@ Two quiet bugs show up whenever operational forecasting or rollout telemetry shi
 `guarded-forecast-publisher` addresses both problems with two decoupled primitives:
 
 - **Contract-gated atomic publishing:** Separates telemetry snapshots from model approval (`review_status == "approved"`, minimum backtest sample count and `p10-p90` coverage, non-crossing quantile enforcement, and SHA-256 `input_fingerprint` skip-when-unchanged before `os.replace()`).
-- **Empirical Bayes rollout shrinkage (`lambda = n / (n + k)`):** Anchors low-sample or unreported regions toward the fleet baseline prior, models standard error floor bounds (`max(se_floor, se_scale / sqrt(n))`), and emits Monte Carlo 95% credible intervals verified by a progressive convergence backtest.
+- **Normal-Normal conjugate Empirical Bayes shrinkage:** Given `prior_sigma` (`tau_0`) and `within_shard_sigma` (`sigma_obs`), weights each region by `lambda_r = tau_0^2 / (tau_0^2 + (sigma_obs^2 / n_r) * fpc)` toward `fleet_prior_delta` with posterior variance `(1 - lambda_r) * tau_0^2`, plus optional finite-population correction (`region_total_shards`, driving `lambda_r -> 1.0` and `SE -> 0` at 100% reporting) and a legacy `lambda = n / (n + k)` mode when sigma priors are omitted.
 
 ## Origin & Sanitization
 
@@ -54,8 +54,8 @@ Telemetry Snapshot                      Versioned Model Artifact
 
 Partial Canary Shards -----> estimate_empirical_bayes_rollout()
 (reported_fraction, N)       |-- Filter min fraction & min sample count
-                             |-- Shrink low-N regions: lambda = n / (n + k)
-                             +-- Monte Carlo draws -> 95% CI & SLO breach prob
+                             |-- Conjugate EB: lambda = tau0^2 / (tau0^2 + sigma_obs^2/n * fpc)
+                             +-- Monte Carlo draws -> calibrated 95% CI & SLO breach prob
 ```
 
 ## Local Quickstart
@@ -68,20 +68,20 @@ pytest -v
 python scripts/run_replay_demo.py
 ```
 
-## Measured 50-Seed Monte Carlo Convergence Results
+## Measured 200-Seed Hierarchical Monte Carlo Convergence Results
 
-Output from `python scripts/run_replay_demo.py` across `seeds 1..50` (`true_fleet_delta = 0.008308` across `60` shards with skewed fast-reporting early clusters):
+Output from `python scripts/run_replay_demo.py` across `seeds 1..200` (`fleet_prior_delta = 0.005`, `prior_sigma = 0.012`, `within_shard_sigma = 0.018`, `60` shards across `4` regions with skewed fast-reporting early canary shards):
 
 | Rollout Checkpoint | Reported Shards | Raw MAE | EB Shrunk MAE | Raw Median AE | EB Median AE | Empirical 95% CI Coverage |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| `5%` | `3` | `0.051262` | `0.002339` | `0.052918` | `0.002310` | `1.0000` (`50/50`) |
-| `25%` | `15` | `0.018327` | `0.001778` | `0.018217` | `0.001804` | `1.0000` (`50/50`) |
-| `50%` | `30` | `0.006475` | `0.002238` | `0.006451` | `0.002240` | `1.0000` (`50/50`) |
-| `100%` | `60` | `0.001663` | `0.002309` | `0.001368` | `0.002377` | `0.8000` (`40/50`) |
+| `5%` | `3` | `0.012506` | `0.005259` | `0.010786` | `0.004470` | `0.9450` (`189/200`) |
+| `25%` | `15` | `0.010966` | `0.005225` | `0.009735` | `0.004426` | `0.9450` (`189/200`) |
+| `50%` | `30` | `0.007067` | `0.004493` | `0.006320` | `0.003600` | `0.9500` (`190/200`) |
+| `100%` | `60` | `0.002686` | `0.001846` | `0.002152` | `0.001761` | `0.9650` (`193/200`) |
 
-### Bias-Variance Trade-Off at `100%` Completion
+### Conjugate Posterior & Finite-Population Behavior Across Full Rollout
 
-Empirical Bayes shrinkage improves estimation accuracy sharply during early partial rollouts (`5%` to `50%`), cutting Mean Absolute Error by ~21.9x at `5%` (`0.002339` vs `0.051262`) and ~10.3x at `25%` (`0.001778` vs `0.018327`) while preserving `50/50` (`100%`) credible interval coverage. Once `100%` of clusters have reported, however, continued shrinkage toward `fleet_prior_delta` introduces residual bias (`EB MAE = 0.002309` vs `Raw MAE = 0.001663`, dropping empirical 95% CI coverage to `40/50` / `80%`) relative to the full-fleet raw sample mean. Empirical Bayes shrinkage is therefore designed strictly for early partial rollouts (`5%` to `50%`) before switching to the raw unweighted fleet mean near completion.
+Under the Normal-Normal conjugate Empirical Bayes estimator (`lambda_r = tau_0^2 / (tau_0^2 + sigma_obs^2 / n_r)` with posterior standard error `sqrt((1 - lambda_r) * tau_0^2)`), EB shrinkage improves accuracy over the raw sample mean at every rollout stage (`5%` through `100%`, cutting MAE from `0.012506` to `0.005259` at `5%` and from `0.002686` to `0.001846` at `100%`) while holding empirical 95% credible interval coverage calibrated (`94.5%` to `96.5%` across all four checkpoints). When finite-population convergence to the realized cohort mean is desired instead of super-population inference, passing `region_total_shards` applies a finite-population correction (`fpc = max(0, 1 - n_r / N_tot)`), driving `lambda_r = 1.0`, `shrunk_mean = raw_mean`, and `standard_error = 0.0` at `100%` reporting.
 
 ## License
 
